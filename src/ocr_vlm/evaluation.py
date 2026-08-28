@@ -22,12 +22,8 @@ from typing import Dict, List, Any
 from collections import defaultdict
 
 import typer
-import sys
 
-# Add scripts to path
-sys.path.insert(0, str(Path(__file__).parent))
-
-from utils.metrics import (
+from .metrics import (
     calculate_exact_match,
     calculate_token_f1,
     calculate_numeric_tolerance,

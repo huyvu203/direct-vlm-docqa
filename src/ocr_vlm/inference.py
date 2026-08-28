@@ -13,19 +13,15 @@ Usage:
 """
 
 import json
-import sys
 from pathlib import Path
 from typing import Optional
 
 import typer
 from tqdm import tqdm
 
-# Add scripts to path
-sys.path.insert(0, str(Path(__file__).parent))
-
-from utils.vlm_client import VLMClient
-from utils.prompt_templates import PromptTemplate
-from utils.retry_handler import RetryHandler, JSONValidationError
+from .prompts import PromptTemplate
+from .retry import JSONValidationError, RetryHandler
+from .vlm_client import VLMClient
 
 app = typer.Typer()
 
