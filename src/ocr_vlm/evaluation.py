@@ -1,324 +1,223 @@
-#!/usr/bin/env python3
-"""
-Evaluation Script for DocQA
-Computes metrics from huy_article.md:
-- Exact Match (EM)
-- Token F1
-- Numeric Tolerance (±0.5%)
-- Operational metrics (latency, cost)
-- Per-question-type breakdown
-
-Usage:
-    python scripts/06_evaluate_qa.py \
-        --pred vlm=outputs/answers/vlm_test.jsonl \
-        --questions data/processed/questions/test.jsonl \
-        --output results/vlm_metrics.json
-"""
+"""Evaluate VLM predictions against prepared DocumentVQA answers."""
 
 import json
 import statistics
 from pathlib import Path
-from typing import Dict, List, Any
-from collections import defaultdict
+from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 import typer
 
-from .metrics import (
-    calculate_exact_match,
-    calculate_token_f1,
-    calculate_numeric_tolerance,
-    classify_question_type
-)
+from .jsonl import read_jsonl
+from .metrics import best_exact_match, best_token_f1, percentile
 
 app = typer.Typer()
 
 
-def load_jsonl(path: Path) -> List[Dict[str, Any]]:
-    """Load JSONL file into list of dicts."""
-    data = []
-    with open(path, 'r') as f:
-        for line in f:
-            data.append(json.loads(line))
-    return data
+def index_by_question_id(
+    records: Sequence[Mapping[str, Any]],
+    label: str,
+) -> Dict[str, Mapping[str, Any]]:
+    """Index records and reject missing or duplicate question IDs."""
+    indexed: Dict[str, Mapping[str, Any]] = {}
+    duplicates = set()
+
+    for position, record in enumerate(records, start=1):
+        if "question_id" not in record:
+            raise ValueError(f"{label} record {position} is missing question_id")
+        question_id = str(record["question_id"])
+        if question_id in indexed:
+            duplicates.add(question_id)
+        indexed[question_id] = record
+
+    if duplicates:
+        raise ValueError(f"Duplicate {label} question IDs: {sorted(duplicates)}")
+    return indexed
 
 
-def calculate_percentile(values: List[float], percentile: float) -> float:
-    """Calculate percentile of a list of values."""
-    if not values:
-        return 0.0
-    sorted_values = sorted(values)
-    index = int(len(sorted_values) * percentile / 100)
-    return sorted_values[min(index, len(sorted_values) - 1)]
-
-
-@app.command()
-def evaluate(
-    pred: List[str] = typer.Option(
-        ...,
-        help="Prediction files in format 'name=path.jsonl' (can specify multiple)"
-    ),
-    questions: Path = typer.Option(
-        ...,
-        help="Ground truth questions JSONL file"
-    ),
-    output: Path = typer.Option(
-        ...,
-        help="Output path for metrics JSON"
-    ),
-    verbose: bool = typer.Option(
-        False,
-        help="Print detailed per-question results"
-    )
-):
-    """
-    Evaluate DocQA predictions against ground truth.
-    
-    Computes all metrics from huy_article.md:
-    - Accuracy: EM, Token F1, Numeric Tolerance
-    - Operational: Latency (median, p95), Cost, Tokens
-    - Per-question-type breakdown
-    """
-    # Parse prediction file arguments
-    pred_files = {}
-    for p in pred:
-        if '=' not in p:
-            typer.echo(f"Error: Prediction must be in format 'name=path', got: {p}", err=True)
-            raise typer.Exit(1)
-        name, path = p.split('=', 1)
-        pred_files[name] = Path(path)
-    
-    # Load ground truth
-    typer.echo(f"Loading ground truth from {questions}...")
-    gt_data = load_jsonl(questions)
-    gt_dict = {item['question_id']: item for item in gt_data}
-    typer.echo(f"Loaded {len(gt_dict)} ground truth questions")
-    
-    # Evaluate each prediction file
-    all_metrics = {}
-    
-    for name, pred_path in pred_files.items():
-        typer.echo(f"\nEvaluating predictions: {name} from {pred_path}")
-        
-        pred_data = load_jsonl(pred_path)
-        typer.echo(f"Loaded {len(pred_data)} predictions")
-        
-        # Calculate metrics
-        metrics = evaluate_predictions(pred_data, gt_dict, verbose)
-        all_metrics[name] = metrics
-        
-        # Print summary
-        print_metrics_summary(name, metrics)
-    
-    # Save results
-    output.parent.mkdir(parents=True, exist_ok=True)
-    with open(output, 'w') as f:
-        json.dump(all_metrics, f, indent=2)
-    
-    typer.echo(f"\n✓ Metrics saved to {output}")
-
-
-def evaluate_predictions(
-    predictions: List[Dict[str, Any]],
-    ground_truth: Dict[str, Dict[str, Any]],
-    verbose: bool = False
+def evaluate_records(
+    questions: Sequence[Mapping[str, Any]],
+    predictions: Sequence[Mapping[str, Any]],
 ) -> Dict[str, Any]:
-    """
-    Evaluate predictions against ground truth.
-    
-    Returns dict with all metrics from article.
-    """
-    # Overall metrics
-    em_scores = []
-    f1_scores = []
-    numeric_scores = []
-    
-    # Per-question-type metrics
-    type_metrics = defaultdict(lambda: {
-        'em_scores': [],
-        'f1_scores': [],
-        'count': 0
-    })
-    
-    # Operational metrics
-    latencies = []
-    tokens_input = []
-    tokens_output = []
-    costs = []
-    retry_counts = 0
-    error_counts = 0
-    
-    # Error analysis
-    errors = []
-    
-    for pred in predictions:
-        question_id = pred['question_id']
-        
-        # Skip if ground truth not found
-        if question_id not in ground_truth:
-            if verbose:
-                typer.echo(f"Warning: No ground truth for {question_id}", err=True)
+    """Calculate accuracy, coverage, latency, token, and reliability metrics."""
+    question_index = index_by_question_id(questions, "question")
+    prediction_index = index_by_question_id(predictions, "prediction")
+
+    exact_scores: List[float] = []
+    f1_scores: List[float] = []
+    latencies: List[float] = []
+    matched_count = 0
+    error_count = 0
+    incomplete_count = 0
+    retry_questions = 0
+    retry_attempts = 0
+    input_tokens = 0
+    output_tokens = 0
+    reasoning_tokens = 0
+
+    for question_id, question in question_index.items():
+        references = question.get("answers")
+        if not isinstance(references, list) or not references:
+            raise ValueError(f"Question {question_id} has no reference answers")
+
+        prediction = prediction_index.get(question_id)
+        if prediction is None:
+            exact_scores.append(0.0)
+            f1_scores.append(0.0)
             continue
-        
-        gt = ground_truth[question_id]
-        pred_answer = pred.get('answer', 'unknown')
-        gt_answer = gt.get('answer', '')
-        question_text = gt.get('question', '')
-        
-        # Skip errors
-        if 'error' in pred or pred_answer in ['ERROR', 'ERROR: Image not found']:
-            error_counts += 1
+
+        matched_count += 1
+        latency = float(prediction.get("latency_ms", 0) or 0)
+        if latency > 0:
+            latencies.append(latency)
+
+        input_tokens += int(prediction.get("input_tokens", 0) or 0)
+        output_tokens += int(prediction.get("output_tokens", 0) or 0)
+        reasoning_tokens += int(prediction.get("reasoning_tokens", 0) or 0)
+
+        attempt_count = int(prediction.get("attempt_count", 0) or 0)
+        if attempt_count > 1:
+            retry_questions += 1
+            retry_attempts += attempt_count - 1
+
+        if prediction.get("response_status") == "incomplete":
+            incomplete_count += 1
+
+        if prediction.get("error") is not None:
+            error_count += 1
+            exact_scores.append(0.0)
+            f1_scores.append(0.0)
             continue
-        
-        # Calculate accuracy metrics
-        em = calculate_exact_match(pred_answer, gt_answer)
-        f1 = calculate_token_f1(pred_answer, gt_answer)
-        numeric = calculate_numeric_tolerance(pred_answer, gt_answer)
-        
-        em_scores.append(em)
-        f1_scores.append(f1)
-        numeric_scores.append(numeric)
-        
-        # Classify question type and track
-        q_type = classify_question_type(question_text)
-        type_metrics[q_type]['em_scores'].append(em)
-        type_metrics[q_type]['f1_scores'].append(f1)
-        type_metrics[q_type]['count'] += 1
-        
-        # Operational metrics
-        if 'latency_ms' in pred and pred['latency_ms'] > 0:
-            latencies.append(pred['latency_ms'])
-        if 'tokens_input' in pred:
-            tokens_input.append(pred['tokens_input'])
-        if 'tokens_output' in pred:
-            tokens_output.append(pred['tokens_output'])
-        if 'cost_usd' in pred:
-            costs.append(pred['cost_usd'])
-        if pred.get('retry_needed', False):
-            retry_counts += 1
-        
-        # Track errors for analysis
-        if em == 0.0:
-            errors.append({
-                'question_id': question_id,
-                'question': question_text,
-                'predicted': pred_answer,
-                'ground_truth': gt_answer,
-                'f1': f1,
-                'type': q_type
-            })
-        
-        if verbose and em == 0.0:
-            typer.echo(f"  ✗ {question_id}: '{pred_answer}' vs '{gt_answer}' (F1: {f1:.2f})")
-    
-    # Compile metrics
-    total_questions = len(em_scores)
-    
-    metrics = {
-        'accuracy': {
-            'exact_match': sum(em_scores) / total_questions if total_questions > 0 else 0.0,
-            'token_f1': sum(f1_scores) / total_questions if total_questions > 0 else 0.0,
-            'numeric_tolerance': sum(numeric_scores) / total_questions if total_questions > 0 else 0.0,
-            'total_questions': total_questions
+
+        answer = prediction.get("answer")
+        if not isinstance(answer, str):
+            raise ValueError(f"Prediction {question_id} has no string answer")
+
+        exact_scores.append(best_exact_match(answer, references))
+        f1_scores.append(best_token_f1(answer, references))
+
+    total_questions = len(question_index)
+    missing_count = total_questions - matched_count
+    extra_count = len(set(prediction_index).difference(question_index))
+    successful_count = matched_count - error_count
+    failure_count = missing_count + error_count
+    token_denominator = matched_count or 1
+
+    return {
+        "dataset": {
+            "questions": total_questions,
+            "predictions": len(prediction_index),
+            "matched": matched_count,
+            "successful": successful_count,
+            "missing": missing_count,
+            "extra": extra_count,
         },
-        'by_question_type': {},
-        'operational': {},
-        'errors': {
-            'error_count': error_counts,
-            'retry_count': retry_counts,
-            'retry_rate_percent': retry_counts / total_questions * 100 if total_questions > 0 else 0.0
-        }
+        "accuracy": {
+            "exact_match": (
+                sum(exact_scores) / total_questions if total_questions else 0.0
+            ),
+            "token_f1": (
+                sum(f1_scores) / total_questions if total_questions else 0.0
+            ),
+        },
+        "latency": {
+            "mean_ms": statistics.mean(latencies) if latencies else 0.0,
+            "median_ms": statistics.median(latencies) if latencies else 0.0,
+            "p95_ms": percentile(latencies, 95),
+        },
+        "tokens": {
+            "total_input": input_tokens,
+            "total_output": output_tokens,
+            "total_reasoning": reasoning_tokens,
+            "average_input": input_tokens / token_denominator,
+            "average_output": output_tokens / token_denominator,
+            "average_reasoning": reasoning_tokens / token_denominator,
+        },
+        "reliability": {
+            "retry_questions": retry_questions,
+            "retry_attempts": retry_attempts,
+            "retry_rate": (
+                retry_questions / total_questions if total_questions else 0.0
+            ),
+            "error_count": error_count,
+            "error_rate": error_count / total_questions if total_questions else 0.0,
+            "incomplete_count": incomplete_count,
+            "missing_predictions": missing_count,
+            "failure_count": failure_count,
+            "failure_rate": (
+                failure_count / total_questions if total_questions else 0.0
+            ),
+        },
     }
-    
-    # Per-question-type breakdown
-    for q_type, type_data in type_metrics.items():
-        count = type_data['count']
-        if count > 0:
-            metrics['by_question_type'][q_type] = {
-                'exact_match': sum(type_data['em_scores']) / count,
-                'token_f1': sum(type_data['f1_scores']) / count,
-                'count': count
-            }
-    
-    # Operational metrics
-    if latencies:
-        metrics['operational']['latency'] = {
-            'median_ms': statistics.median(latencies),
-            'mean_ms': statistics.mean(latencies),
-            'p95_ms': calculate_percentile(latencies, 95),
-            'min_ms': min(latencies),
-            'max_ms': max(latencies)
-        }
-    
-    if tokens_input:
-        metrics['operational']['tokens'] = {
-            'avg_input': statistics.mean(tokens_input),
-            'avg_output': statistics.mean(tokens_output) if tokens_output else 0,
-            'total_input': sum(tokens_input),
-            'total_output': sum(tokens_output) if tokens_output else 0
-        }
-    
-    if costs:
-        total_cost = sum(costs)
-        metrics['operational']['cost'] = {
-            'total_usd': total_cost,
-            'avg_per_question': total_cost / len(costs),
-            'per_100_questions': total_cost / len(costs) * 100
-        }
-    
-    # Add sample errors for analysis
-    metrics['sample_errors'] = errors[:10]  # First 10 errors
-    
+
+
+def evaluate_files(
+    questions_path: Path,
+    predictions_path: Path,
+    output_path: Path,
+    max_questions: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Evaluate JSONL files and write aggregate metrics as JSON."""
+    if max_questions is not None and max_questions <= 0:
+        raise ValueError("max_questions must be greater than zero")
+
+    questions = read_jsonl(questions_path)
+    predictions = read_jsonl(predictions_path)
+    if max_questions is not None:
+        questions = questions[:max_questions]
+        selected_ids = {str(question["question_id"]) for question in questions}
+        predictions = [
+            prediction
+            for prediction in predictions
+            if str(prediction.get("question_id")) in selected_ids
+        ]
+
+    metrics = evaluate_records(questions, predictions)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(
+        json.dumps(metrics, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
     return metrics
 
 
-def print_metrics_summary(name: str, metrics: Dict[str, Any]):
-    """Print formatted metrics summary."""
-    typer.echo(f"\n{'='*60}")
-    typer.echo(f"Metrics for: {name}")
-    typer.echo(f"{'='*60}")
-    
-    # Accuracy
-    acc = metrics['accuracy']
-    typer.echo(f"\nAccuracy Metrics:")
-    typer.echo(f"  Exact Match (EM):      {acc['exact_match']*100:6.1f}%")
-    typer.echo(f"  Token F1:              {acc['token_f1']*100:6.1f}%")
-    typer.echo(f"  Numeric Tolerance:     {acc['numeric_tolerance']*100:6.1f}%")
-    typer.echo(f"  Total Questions:       {acc['total_questions']:6d}")
-    
-    # By question type
-    if 'by_question_type' in metrics and metrics['by_question_type']:
-        typer.echo(f"\nBy Question Type:")
-        for q_type, type_metrics in sorted(metrics['by_question_type'].items()):
-            typer.echo(f"  {q_type:20s}: EM={type_metrics['exact_match']*100:5.1f}%, "
-                      f"F1={type_metrics['token_f1']*100:5.1f}%, n={type_metrics['count']}")
-    
-    # Operational
-    if 'operational' in metrics:
-        op = metrics['operational']
-        
-        if 'latency' in op:
-            typer.echo(f"\nLatency:")
-            typer.echo(f"  Median:   {op['latency']['median_ms']:7.0f}ms")
-            typer.echo(f"  Mean:     {op['latency']['mean_ms']:7.0f}ms")
-            typer.echo(f"  P95:      {op['latency']['p95_ms']:7.0f}ms")
-        
-        if 'tokens' in op:
-            typer.echo(f"\nTokens:")
-            typer.echo(f"  Avg Input:  {op['tokens']['avg_input']:7.0f}")
-            typer.echo(f"  Avg Output: {op['tokens']['avg_output']:7.0f}")
-        
-        if 'cost' in op:
-            typer.echo(f"\nCost:")
-            typer.echo(f"  Total:            ${op['cost']['total_usd']:7.4f}")
-            typer.echo(f"  Per question:     ${op['cost']['avg_per_question']:7.4f}")
-            typer.echo(f"  Per 100 questions: ${op['cost']['per_100_questions']:6.2f}")
-    
-    # Errors
-    if 'errors' in metrics:
-        err = metrics['errors']
-        typer.echo(f"\nErrors & Retries:")
-        typer.echo(f"  Errors:       {err['error_count']:6d}")
-        typer.echo(f"  Retries:      {err['retry_count']:6d} ({err['retry_rate_percent']:.1f}%)")
+def print_summary(metrics: Mapping[str, Any], output_path: Path) -> None:
+    """Print the primary evaluation results."""
+    dataset = metrics["dataset"]
+    accuracy = metrics["accuracy"]
+    reliability = metrics["reliability"]
+
+    typer.echo(f"Questions: {dataset['questions']}; matched: {dataset['matched']}")
+    typer.echo(f"Exact Match: {accuracy['exact_match']:.2%}")
+    typer.echo(f"Token F1: {accuracy['token_f1']:.2%}")
+    typer.echo(
+        f"Retries: {reliability['retry_questions']}; "
+        f"errors: {reliability['error_count']}; "
+        f"missing: {reliability['missing_predictions']}"
+    )
+    typer.echo(f"Metrics saved to {output_path}")
+
+
+@app.command()
+def main(
+    questions: Path = typer.Option(
+        Path("data/processed/questions/dev.jsonl"),
+        help="Prepared questions JSONL file",
+    ),
+    predictions: Path = typer.Option(
+        Path("outputs/predictions/dev.jsonl"),
+        help="Prediction JSONL file",
+    ),
+    output: Path = typer.Option(
+        Path("results/dev_metrics.json"),
+        help="Metrics JSON file",
+    ),
+    max_questions: Optional[int] = typer.Option(
+        None, help="Evaluate only the first questions"
+    ),
+) -> None:
+    """Evaluate DocumentVQA predictions and operational measurements."""
+    metrics = evaluate_files(questions, predictions, output, max_questions)
+    print_summary(metrics, output)
 
 
 if __name__ == "__main__":
