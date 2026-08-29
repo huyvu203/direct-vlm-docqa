@@ -1,257 +1,248 @@
-#!/usr/bin/env python3
-"""
-VLM-based Question Answering Script
-Implements direct vision-language inference from huy_article.md.
+"""Run direct VLM inference over prepared document questions."""
 
-Usage:
-    python scripts/05_answer_questions.py \
-        --mode vlm_image \
-        --model gpt-5 \
-        --questions data/processed/questions/dev.jsonl \
-        --images-root data/raw \
-        --output outputs/answers/vlm_dev.jsonl
-"""
-
-import json
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, List, Optional, Set, cast
 
 import typer
 from tqdm import tqdm
 
-from .prompts import PromptTemplate
-from .retry import JSONValidationError, RetryHandler
+from .jsonl import append_jsonl, read_jsonl, write_jsonl
+from .prompts import build_user_prompt
+from .retry import ResponseValidationError, parse_answer
+from .schemas import PredictionRecord, QuestionRecord
 from .vlm_client import VLMClient
 
 app = typer.Typer()
 
+QUESTION_FIELDS = {"page_id", "question_id", "question", "image_path"}
+
+
+def validate_questions(records: List[Dict[str, Any]]) -> List[QuestionRecord]:
+    """Check the fields inference needs and return typed question records."""
+    for index, record in enumerate(records, start=1):
+        missing = QUESTION_FIELDS.difference(record)
+        if missing:
+            raise ValueError(f"Question record {index} is missing fields: {sorted(missing)}")
+    return cast(List[QuestionRecord], records)
+
+
+def error_prediction(
+    question: QuestionRecord,
+    client: VLMClient,
+    error: str,
+    attempt_count: int = 0,
+    latency_ms: int = 0,
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+    reasoning_tokens: int = 0,
+    response_status: Optional[str] = None,
+    incomplete_reason: Optional[str] = None,
+) -> PredictionRecord:
+    """Create a prediction record for a question that could not be answered."""
+    return {
+        "page_id": question["page_id"],
+        "question_id": question["question_id"],
+        "answer": "unknown",
+        "confidence": 0.0,
+        "model": client.model,
+        "reasoning_effort": client.reasoning_effort,
+        "max_output_tokens": client.max_output_tokens,
+        "latency_ms": latency_ms,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "reasoning_tokens": reasoning_tokens,
+        "attempt_count": attempt_count,
+        "response_status": response_status,
+        "incomplete_reason": incomplete_reason,
+        "error": error,
+    }
+
+
+def infer_question(question: QuestionRecord, client: VLMClient) -> PredictionRecord:
+    """Answer one question, retrying once when response validation fails."""
+    image_path = Path(question["image_path"])
+    if not image_path.is_file():
+        return error_prediction(question, client, f"Image not found: {image_path}")
+
+    latency_ms = 0
+    input_tokens = 0
+    output_tokens = 0
+    reasoning_tokens = 0
+    validation_error = ""
+    response_status: Optional[str] = None
+    incomplete_reason: Optional[str] = None
+
+    for attempt in (1, 2):
+        prompt = build_user_prompt(question["question"], corrective=attempt == 2)
+        try:
+            response = client.generate(image_path, prompt)
+        except Exception as error:
+            return error_prediction(
+                question,
+                client,
+                f"{type(error).__name__}: {error}",
+                attempt,
+                latency_ms,
+                input_tokens,
+                output_tokens,
+                reasoning_tokens,
+                response_status,
+                incomplete_reason,
+            )
+
+        latency_ms += response["latency_ms"]
+        input_tokens += response["input_tokens"]
+        output_tokens += response["output_tokens"]
+        reasoning_tokens += response["reasoning_tokens"]
+        response_status = response["status"]
+        incomplete_reason = response["incomplete_reason"]
+
+        if response_status != "completed":
+            validation_error = incomplete_reason or response_status
+            continue
+
+        try:
+            answer, confidence = parse_answer(response["text"])
+        except ResponseValidationError as error:
+            validation_error = str(error)
+            continue
+
+        return {
+            "page_id": question["page_id"],
+            "question_id": question["question_id"],
+            "answer": answer,
+            "confidence": confidence,
+            "model": client.model,
+            "reasoning_effort": client.reasoning_effort,
+            "max_output_tokens": client.max_output_tokens,
+            "latency_ms": latency_ms,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "reasoning_tokens": reasoning_tokens,
+            "attempt_count": attempt,
+            "response_status": response_status,
+            "incomplete_reason": incomplete_reason,
+            "error": None,
+        }
+
+    if response_status == "incomplete":
+        error_message = f"Model response incomplete after 2 attempts: {validation_error}"
+    else:
+        error_message = f"Invalid model response after 2 attempts: {validation_error}"
+
+    return error_prediction(
+        question,
+        client,
+        error_message,
+        2,
+        latency_ms,
+        input_tokens,
+        output_tokens,
+        reasoning_tokens,
+        response_status,
+        incomplete_reason,
+    )
+
+
+def run_inference(
+    questions_path: Path,
+    output_path: Path,
+    model: str = "gpt-5",
+    max_output_tokens: int = 1000,
+    reasoning_effort: str = "minimal",
+    max_questions: Optional[int] = None,
+    resume: bool = True,
+    client: Optional[VLMClient] = None,
+) -> None:
+    """Generate predictions and save each result immediately as JSONL."""
+    if max_questions is not None and max_questions <= 0:
+        raise ValueError("max_questions must be greater than zero")
+
+    questions = validate_questions(read_jsonl(questions_path))
+    if max_questions is not None:
+        questions = questions[:max_questions]
+
+    completed_ids: Set[str] = set()
+    if resume and output_path.exists():
+        selected_ids = {question["question_id"] for question in questions}
+        existing_predictions = read_jsonl(output_path)
+        kept_predictions = []
+        retried_error_ids: Set[str] = set()
+
+        for record in existing_predictions:
+            question_id = str(record["question_id"])
+            if question_id in selected_ids and record.get("error") is not None:
+                retried_error_ids.add(question_id)
+                continue
+            kept_predictions.append(record)
+            if question_id in selected_ids:
+                completed_ids.add(question_id)
+
+        if retried_error_ids:
+            write_jsonl(output_path, kept_predictions)
+            typer.echo(f"Retrying {len(retried_error_ids)} previous error records")
+    else:
+        write_jsonl(output_path, [])
+
+    pending = [
+        question
+        for question in questions
+        if question["question_id"] not in completed_ids
+    ]
+    if not pending:
+        typer.echo(f"No pending questions; {len(completed_ids)} already completed")
+        return
+
+    inference_client = client or VLMClient(
+        model,
+        max_output_tokens,
+        reasoning_effort,
+    )
+    retries = 0
+    errors = 0
+    for question in tqdm(pending, desc="Answering questions"):
+        prediction = infer_question(question, inference_client)
+        append_jsonl(output_path, prediction)
+        retries += int(prediction["attempt_count"] > 1)
+        errors += int(prediction["error"] is not None)
+
+    typer.echo(f"Processed {len(pending)} questions with {inference_client.model}")
+    typer.echo(f"Retries: {retries}; errors: {errors}")
+    typer.echo(f"Predictions saved to {output_path}")
+
 
 @app.command()
-def answer_questions(
-    mode: str = typer.Option(
-        "vlm_image",
-        help="Mode: 'vlm_image' for direct VLM, 'textract_llm' for OCR+LLM"
-    ),
+def main(
     questions: Path = typer.Option(
-        ...,
-        help="Path to questions JSONL file"
-    ),
-    images_root: Path = typer.Option(
-        Path("data/raw"),
-        help="Root directory for images"
+        Path("data/processed/questions/dev.jsonl"),
+        help="Prepared questions JSONL file",
     ),
     output: Path = typer.Option(
-        ...,
-        help="Output path for answers JSONL"
+        Path("outputs/predictions/dev.jsonl"),
+        help="Prediction JSONL file",
     ),
-    model: str = typer.Option(
-        "gpt-5",
-        help="Model name (e.g., gpt-5, gpt-4o)"
-    ),
-    prompt_template: Optional[Path] = typer.Option(
-        None,
-        help="Optional custom prompt template file"
+    model: str = typer.Option("gpt-5", help="OpenAI vision-capable model ID"),
+    max_output_tokens: int = typer.Option(1000, help="Maximum tokens per response"),
+    reasoning_effort: str = typer.Option(
+        "minimal", help="GPT-5 reasoning effort"
     ),
     max_questions: Optional[int] = typer.Option(
-        None,
-        help="Maximum number of questions to process (for testing)"
+        None, help="Limit questions for a smoke test"
+    ),
+    resume: bool = typer.Option(
+        True, "--resume/--overwrite", help="Resume an existing output file"
+    ),
+) -> None:
+    """Answer prepared DocumentVQA questions directly from their images."""
+    run_inference(
+        questions,
+        output,
+        model,
+        max_output_tokens,
+        reasoning_effort,
+        max_questions,
+        resume,
     )
-):
-    """
-    Answer DocQA questions using VLM.
-    
-    Implements the pipeline from huy_article.md:
-    - Single-step: Image + Question → GPT-5 → Answer
-    - Temperature: 0.0 (deterministic)
-    - Max tokens: 150
-    - High detail vision mode
-    - Single retry on JSON validation failure
-    """
-    if mode != "vlm_image":
-        typer.echo(f"Error: Mode '{mode}' not implemented. Use 'vlm_image'.", err=True)
-        raise typer.Exit(1)
-    
-    typer.echo(f"Loading questions from {questions}...")
-    question_data = []
-    with open(questions, 'r') as f:
-        for line in f:
-            question_data.append(json.loads(line))
-    
-    if max_questions:
-        question_data = question_data[:max_questions]
-        typer.echo(f"Limited to {max_questions} questions for testing")
-    
-    typer.echo(f"Loaded {len(question_data)} questions")
-    
-    # Initialize VLM client
-    typer.echo(f"Initializing VLM client with model: {model}")
-    client = VLMClient(model=model, temperature=0.0, max_tokens=150)
-    
-    # Load prompts
-    if prompt_template:
-        typer.echo(f"Loading custom prompt template from {prompt_template}")
-        prompts = PromptTemplate.load_from_file(str(prompt_template))
-        system_message = prompts['system']
-        user_template = prompts['user']
-    else:
-        typer.echo("Using default prompt templates from article")
-        system_message = PromptTemplate.get_system_message()
-        user_template = PromptTemplate.USER_TEMPLATE
-    
-    # Process questions
-    typer.echo(f"\nProcessing {len(question_data)} questions with {model}...")
-    
-    output.parent.mkdir(parents=True, exist_ok=True)
-    
-    results = []
-    retry_count = 0
-    validation_failures = 0
-    
-    with open(output, 'w') as out_f:
-        for q_data in tqdm(question_data, desc="Answering questions"):
-            question_id = q_data['question_id']
-            page_id = q_data['page_id']
-            question_text = q_data['question']
-            ground_truth = q_data.get('answer', '')
-            
-            # Find image path
-            # Try multiple possible locations
-            possible_paths = [
-                images_root / page_id / f"{page_id}.png",
-                images_root / "infographicvqa" / f"{page_id}.png",
-                images_root / f"{page_id}.png",
-            ]
-            
-            image_path = None
-            for path in possible_paths:
-                if path.exists():
-                    image_path = path
-                    break
-            
-            if not image_path:
-                # Log error but continue
-                result = {
-                    "question_id": question_id,
-                    "page_id": page_id,
-                    "question": question_text,
-                    "answer": "ERROR: Image not found",
-                    "confidence": 0.0,
-                    "latency_ms": 0,
-                    "tokens_input": 0,
-                    "tokens_output": 0,
-                    "cost_usd": 0.0,
-                    "retry_needed": False,
-                    "error": f"Image not found at {possible_paths[0]}"
-                }
-                out_f.write(json.dumps(result) + '\n')
-                validation_failures += 1
-                continue
-            
-            # Call VLM
-            retry_needed = False
-            try:
-                response = client.answer_question(
-                    image_path=str(image_path),
-                    question=question_text,
-                    system_message=system_message,
-                    user_template=user_template
-                )
-                
-                # Parse and validate response
-                try:
-                    parsed = RetryHandler.parse_and_validate(response['response'])
-                    answer = parsed['answer']
-                    confidence = float(parsed['confidence'])
-                
-                except JSONValidationError as e:
-                    # Retry with corrective prompt
-                    retry_needed = True
-                    retry_count += 1
-                    
-                    # Create corrective prompt
-                    corrective_user_prompt = RetryHandler.get_corrective_prompt(
-                        user_template.format(question=question_text)
-                    )
-                    
-                    # Retry
-                    response = client.call_vision_api(
-                        image_path=str(image_path),
-                        prompt=corrective_user_prompt,
-                        system_message=system_message
-                    )
-                    
-                    try:
-                        parsed = RetryHandler.parse_and_validate(response['response'])
-                        answer = parsed['answer']
-                        confidence = float(parsed['confidence'])
-                    except JSONValidationError:
-                        # Still failed after retry
-                        validation_failures += 1
-                        answer = "unknown"
-                        confidence = 0.0
-                
-                # Build result
-                result = {
-                    "question_id": question_id,
-                    "page_id": page_id,
-                    "question": question_text,
-                    "ground_truth": ground_truth,
-                    "answer": answer,
-                    "confidence": confidence,
-                    "latency_ms": response['latency_ms'],
-                    "tokens_input": response['tokens_input'],
-                    "tokens_output": response['tokens_output'],
-                    "cost_usd": response['cost_usd'],
-                    "retry_needed": retry_needed
-                }
-                
-            except Exception as e:
-                # API error or other failure
-                result = {
-                    "question_id": question_id,
-                    "page_id": page_id,
-                    "question": question_text,
-                    "ground_truth": ground_truth,
-                    "answer": "ERROR",
-                    "confidence": 0.0,
-                    "latency_ms": 0,
-                    "tokens_input": 0,
-                    "tokens_output": 0,
-                    "cost_usd": 0.0,
-                    "retry_needed": False,
-                    "error": str(e)
-                }
-                validation_failures += 1
-            
-            # Write result
-            out_f.write(json.dumps(result) + '\n')
-            results.append(result)
-    
-    # Summary statistics
-    total_questions = len(question_data)
-    retry_rate = (retry_count / total_questions * 100) if total_questions > 0 else 0
-    failure_rate = (validation_failures / total_questions * 100) if total_questions > 0 else 0
-    
-    typer.echo(f"\n✓ Processing complete!")
-    typer.echo(f"  Total questions: {total_questions}")
-    typer.echo(f"  Retries needed: {retry_count} ({retry_rate:.1f}%)")
-    typer.echo(f"  Validation failures: {validation_failures} ({failure_rate:.1f}%)")
-    typer.echo(f"  Results written to: {output}")
-    
-    # Calculate aggregate stats if we have valid results
-    valid_results = [r for r in results if 'error' not in r and r['answer'] != 'ERROR']
-    if valid_results:
-        avg_latency = sum(r['latency_ms'] for r in valid_results) / len(valid_results)
-        total_cost = sum(r['cost_usd'] for r in valid_results)
-        avg_tokens_in = sum(r['tokens_input'] for r in valid_results) / len(valid_results)
-        avg_tokens_out = sum(r['tokens_output'] for r in valid_results) / len(valid_results)
-        
-        typer.echo(f"\nOperational Metrics:")
-        typer.echo(f"  Avg latency: {avg_latency:.0f}ms")
-        typer.echo(f"  Avg tokens (input): {avg_tokens_in:.0f}")
-        typer.echo(f"  Avg tokens (output): {avg_tokens_out:.0f}")
-        typer.echo(f"  Total cost: ${total_cost:.4f}")
-        typer.echo(f"  Cost per 100 questions: ${total_cost / len(valid_results) * 100:.2f}")
 
 
 if __name__ == "__main__":

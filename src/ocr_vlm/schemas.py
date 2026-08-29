@@ -20,10 +20,15 @@ class ModelAnswer(TypedDict):
     answer: str
     confidence: float
     model: str
+    reasoning_effort: str
+    max_output_tokens: int
     latency_ms: int
     input_tokens: int
     output_tokens: int
+    reasoning_tokens: int
     attempt_count: int
+    response_status: Optional[str]
+    incomplete_reason: Optional[str]
     error: Optional[str]
 
 
