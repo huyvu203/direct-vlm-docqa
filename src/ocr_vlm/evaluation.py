@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 import typer
+from anls import anls_score
 
 from .jsonl import read_jsonl
 from .metrics import best_exact_match, best_token_f1, percentile
@@ -38,12 +39,13 @@ def evaluate_records(
     questions: Sequence[Mapping[str, Any]],
     predictions: Sequence[Mapping[str, Any]],
 ) -> Dict[str, Any]:
-    """Calculate accuracy, coverage, latency, token, and reliability metrics."""
+    """Calculate ANLS and supporting operational and accuracy metrics."""
     question_index = index_by_question_id(questions, "question")
     prediction_index = index_by_question_id(predictions, "prediction")
 
     exact_scores: List[float] = []
     f1_scores: List[float] = []
+    anls_scores: List[float] = []
     latencies: List[float] = []
     matched_count = 0
     error_count = 0
@@ -63,6 +65,7 @@ def evaluate_records(
         if prediction is None:
             exact_scores.append(0.0)
             f1_scores.append(0.0)
+            anls_scores.append(0.0)
             continue
 
         matched_count += 1
@@ -86,6 +89,7 @@ def evaluate_records(
             error_count += 1
             exact_scores.append(0.0)
             f1_scores.append(0.0)
+            anls_scores.append(0.0)
             continue
 
         answer = prediction.get("answer")
@@ -94,6 +98,9 @@ def evaluate_records(
 
         exact_scores.append(best_exact_match(answer, references))
         f1_scores.append(best_token_f1(answer, references))
+        anls_scores.append(
+            anls_score(prediction=answer, gold_labels=references, threshold=0.5)
+        )
 
     total_questions = len(question_index)
     missing_count = total_questions - matched_count
@@ -112,6 +119,7 @@ def evaluate_records(
             "extra": extra_count,
         },
         "accuracy": {
+            "anls": sum(anls_scores) / total_questions if total_questions else 0.0,
             "exact_match": (
                 sum(exact_scores) / total_questions if total_questions else 0.0
             ),
@@ -187,6 +195,7 @@ def print_summary(metrics: Mapping[str, Any], output_path: Path) -> None:
     reliability = metrics["reliability"]
 
     typer.echo(f"Questions: {dataset['questions']}; matched: {dataset['matched']}")
+    typer.echo(f"ANLS: {accuracy['anls']:.2%}")
     typer.echo(f"Exact Match: {accuracy['exact_match']:.2%}")
     typer.echo(f"Token F1: {accuracy['token_f1']:.2%}")
     typer.echo(

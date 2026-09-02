@@ -112,6 +112,7 @@ class EvaluationTests(unittest.TestCase):
         })
         self.assertAlmostEqual(metrics["accuracy"]["exact_match"], 1 / 3)
         self.assertAlmostEqual(metrics["accuracy"]["token_f1"], 1 / 3)
+        self.assertAlmostEqual(metrics["accuracy"]["anls"], 1 / 3)
         self.assertEqual(metrics["latency"]["mean_ms"], 200)
         self.assertEqual(metrics["latency"]["median_ms"], 200)
         self.assertEqual(metrics["latency"]["p95_ms"], 300)
@@ -126,6 +127,24 @@ class EvaluationTests(unittest.TestCase):
         self.assertEqual(metrics["reliability"]["incomplete_count"], 1)
         self.assertEqual(metrics["reliability"]["missing_predictions"], 1)
         self.assertEqual(metrics["reliability"]["failure_count"], 2)
+
+    def test_anls_allows_minor_ocr_errors_and_uses_best_reference(self):
+        questions = [make_question("1", ["Coca Cola Company", "Coca Cola"])]
+        predictions = [make_prediction("1", "CocaCola")]
+
+        metrics = evaluate_records(questions, predictions)
+
+        self.assertAlmostEqual(metrics["accuracy"]["anls"], 8 / 9)
+        self.assertEqual(metrics["accuracy"]["exact_match"], 0.0)
+        self.assertEqual(metrics["accuracy"]["token_f1"], 0.0)
+
+    def test_anls_rejects_dissimilar_answers(self):
+        questions = [make_question("1", ["Coca Cola"])]
+        predictions = [make_prediction("1", "Cat")]
+
+        metrics = evaluate_records(questions, predictions)
+
+        self.assertEqual(metrics["accuracy"]["anls"], 0.0)
 
     def test_duplicate_predictions_are_rejected(self):
         questions = [make_question("1", ["answer"])]
