@@ -1,340 +1,158 @@
-# VLM-based DocQA Pipeline
+# Direct VLM Document QA Evaluation
 
-Implementation of a multimodal DocQA pipeline for evaluating direct vision-language models on document question answering tasks.
+A small evaluation pipeline for answering questions directly from document images
+with a vision-language model (VLM). The project measures answer quality, request
+latency, token usage, retries, and failures without using a separate OCR stage.
 
-## Overview
+## Objective
 
-This project implements a **single-step vision-language pipeline**:
+The goal is to evaluate a simple image-to-answer workflow:
 
-```
-Image + Question → VLM (GPT-5) → Answer
-```
-
-The pipeline eliminates traditional OCR stages by sending images and questions directly to multimodal language models, simplifying architecture while maintaining high accuracy on document understanding tasks.
-
-## Project Structure
-
-```
-ocr-vlm-exp/
-├── data/
-│   ├── raw/                          # Dataset images
-│   └── processed/
-│       ├── manifests/                # Page manifests (dev/test)
-│       └── questions/                # Question files (dev/test)
-├── outputs/
-│   └── answers/                      # VLM predictions
-├── results/                          # Evaluation metrics
-├── reports/                          # Analysis reports
-├── scripts/
-│   ├── 01_prepare_dataset.py         # Dataset download & splitting
-│   ├── 05_answer_questions.py        # VLM inference engine
-│   ├── 06_evaluate_qa.py            # Metrics computation
-│   └── utils/                        # Core utilities
-│       ├── vlm_client.py            # GPT-5 Vision API wrapper
-│       ├── prompt_templates.py       # Prompt engineering
-│       ├── metrics.py               # EM, F1, numeric tolerance
-│       └── retry_handler.py         # JSON validation & retry
-├── prompts/
-│   └── qa_vlm.txt                   # Prompt template from article
-└── requirements.txt
+```text
+Document image + question -> GPT-5 -> structured answer -> offline evaluation
 ```
 
-## Complete Step-by-Step Guide
+The experiment uses 500 questions sampled reproducibly from the validation split
+of [DocumentVQA](https://huggingface.co/datasets/HuggingFaceM4/DocumentVQA):
 
-### Step 1: Environment Setup
+- 120 development questions for testing the prompt and pipeline.
+- 380 document-disjoint held-out questions for final evaluation.
+
+No training or fine-tuning is performed. Documents used in development are
+excluded from the held-out set.
+
+## Evaluation
+
+The model receives a high-detail document image and one question through the
+OpenAI Responses API. It returns a structured answer and confidence value. The
+default configuration uses `gpt-5`, minimal reasoning effort, and a maximum of
+1,000 output tokens.
+
+The primary metric is **Average Normalized Levenshtein Similarity (ANLS)**, which
+gives partial credit for small OCR-like character errors and assigns zero to
+answers beyond its 0.5 distance threshold. Normalized Exact Match and token-level
+F1 are retained as supporting metrics.
+
+The evaluator also reports request latency, token usage, retries, API errors, and
+missing predictions. Evaluation is offline once predictions have been generated.
+
+## Final results
+
+Results on the 380-question held-out subset:
+
+| Metric | Result |
+|---|---:|
+| ANLS (primary) | **93.25%** |
+| Normalized Exact Match | 87.89% |
+| Token F1 | 93.13% |
+| Mean request latency | 3.07 s |
+| Median request latency | 2.96 s |
+| P95 request latency | 5.07 s |
+| Retries | 0 |
+| Errors | 0 |
+| Missing predictions | 0 |
+
+All 380 questions produced successful predictions. Average usage was 818 input
+tokens and 35.5 output tokens per question.
+
+These are project results on a held-out subset of the official validation split,
+not scores from the hidden DocumentVQA test set or official leaderboard. Latency
+measures the API request rather than complete end-to-end program runtime.
+
+## Project structure
+
+```text
+ocr-vlm-experiment/
+├── src/ocr_vlm/           # Dataset, inference, and evaluation logic
+├── scripts/               # Thin Python entry points
+├── tests/                 # Offline unit tests
+├── data/                  # Generated questions and document images
+├── outputs/predictions/   # Generated model predictions
+├── results/               # Generated aggregate metrics
+├── .env.example
+├── pyproject.toml
+└── README.md
+```
+
+The `ocr-vlm-*` commands installed from `pyproject.toml` are the recommended way
+to run the pipeline. The files in `scripts/` provide equivalent Python entry
+points.
+
+## Run guide
+
+### 1. Set up the environment
+
+Python 3.10 or newer is required.
 
 ```bash
-# Navigate to project directory
-cd ocr-vlm-exp
-
-# Create virtual environment
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
-
-# Install dependencies
-pip install -r requirements.txt
+python -m venv .venv
+source .venv/bin/activate
+pip install -e .
 ```
 
-### Step 2: Configure API Keys
+Create the local environment file and add your OpenAI API key:
 
 ```bash
-# Copy environment template
 cp .env.example .env
-
-# Edit .env and add your OpenAI API key
-nano .env  # or use your preferred editor (vim, code, etc.)
 ```
 
-Add this line to `.env`:
-```
-OPENAI_API_KEY=sk-your-actual-openai-key-here
-```
-
-Load the environment variable:
-```bash
-# Load API key into current session
-export $(grep -v '^#' .env | xargs)
-
-# Or manually export it
-export OPENAI_API_KEY=sk-your-key-here
+```dotenv
+OPENAI_API_KEY=your-key-here
 ```
 
-### Step 3: Download and Prepare Dataset
+The key is loaded automatically from `.env`. Dataset preparation and inference
+require internet access, and inference incurs OpenAI API usage.
 
-Download InfographicVQA dataset and create dev/test splits:
+### 2. Prepare the dataset
 
 ```bash
-# Option A: Automatic download (requires Hugging Face login)
-huggingface-cli login  # One-time setup
-python scripts/01_prepare_dataset.py --dev-size 120 --test-size 380
-
-# Option B: If automatic download fails, script creates placeholder structure
-# Then manually add images to data/raw/infographicvqa/
-python scripts/01_prepare_dataset.py --dev-size 120 --test-size 380
+ocr-vlm-prepare
 ```
 
-**This creates:**
-- `data/processed/manifests/{dev,test}.jsonl` - Page metadata (120 + 380 entries)
-- `data/processed/questions/{dev,test}.jsonl` - Questions with ground truth
-- `data/raw/infographicvqa/*.png` - Dataset images (500 images)
+This downloads the required DocumentVQA validation shards, selects the
+document-isolated subsets, and writes:
 
-**Verify dataset:**
-```bash
-# Check question files
-wc -l data/processed/questions/dev.jsonl   # Should show 120
-wc -l data/processed/questions/test.jsonl  # Should show 380
-
-# Check images
-ls data/raw/infographicvqa/*.png | wc -l   # Should show 500
+```text
+data/processed/questions/dev.jsonl
+data/processed/questions/test.jsonl
+data/raw/documentvqa/
 ```
 
-### Step 4: Run VLM Inference
+### 3. Develop and validate
 
-**Quick test (2 questions, ~10 seconds):**
-```bash
-python scripts/05_answer_questions.py \
-    --mode vlm_image \
-    --model gpt-5 \
-    --questions data/processed/questions/dev.jsonl \
-    --images-root data/raw \
-    --output outputs/answers/vlm_quick_test.jsonl \
-    --max-questions 2
-```
-
-**Dev set (120 questions, ~6 minutes, ~$1.07):**
-```bash
-python scripts/05_answer_questions.py \
-    --mode vlm_image \
-    --model gpt-5 \
-    --questions data/processed/questions/dev.jsonl \
-    --images-root data/raw \
-    --output outputs/answers/vlm_gpt5_dev.jsonl
-```
-
-**Test set (380 questions, ~20 minutes, ~$3.38):**
-```bash
-python scripts/05_answer_questions.py \
-    --mode vlm_image \
-    --model gpt-5 \
-    --questions data/processed/questions/test.jsonl \
-    --images-root data/raw \
-    --output outputs/answers/vlm_gpt5_test.jsonl
-```
-
-**Model options:**
-- `gpt-5` - Primary model with native multimodal capabilities
-- `gpt-4o` - Fallback option if GPT-5 has issues
-- `gpt-4-turbo` - Alternative option
-
-**Optional flags:**
-- `--prompt-template prompts/qa_vlm.txt` - Use custom prompt template
-- `--max-questions 10` - Limit number of questions for testing
-
-### Step 5: Evaluate Results
-
-Compute accuracy and operational metrics:
+Run inference and evaluation on the 120-question development subset:
 
 ```bash
-# Evaluate dev set
-python scripts/06_evaluate_qa.py \
-    --pred vlm=outputs/answers/vlm_gpt5_dev.jsonl \
-    --questions data/processed/questions/dev.jsonl \
-    --output results/vlm_gpt5_dev_metrics.json
-
-# Evaluate test set
-python scripts/06_evaluate_qa.py \
-    --pred vlm=outputs/answers/vlm_gpt5_test.jsonl \
-    --questions data/processed/questions/test.jsonl \
-    --output results/vlm_gpt5_test_metrics.json
+ocr-vlm-infer --overwrite
+ocr-vlm-evaluate
 ```
 
-**Add `--verbose` flag to see individual errors:**
-```bash
-python scripts/06_evaluate_qa.py \
-    --pred vlm=outputs/answers/vlm_gpt5_test.jsonl \
-    --questions data/processed/questions/test.jsonl \
-    --output results/vlm_gpt5_test_metrics.json \
-    --verbose
-```
+For a cheaper initial smoke test, add `--max-questions 2` to both commands. Freeze
+the model and prompt settings after development before evaluating the held-out
+subset.
 
-### Step 6: Review Results
-
-**View metrics in terminal:**
-```bash
-# The evaluation script prints summary to terminal
-# Or view the JSON file:
-cat results/vlm_gpt5_test_metrics.json | jq '.'
-
-# View specific metrics:
-cat results/vlm_gpt5_test_metrics.json | jq '.vlm.accuracy'
-cat results/vlm_gpt5_test_metrics.json | jq '.vlm.operational'
-cat results/vlm_gpt5_test_metrics.json | jq '.vlm.by_question_type'
-```
-
-**Output includes:**
-- **Accuracy Metrics:** Exact Match (EM), Token F1, Numeric Tolerance
-- **Operational Metrics:** Latency (median, p95), token counts, cost per 100Q
-- **Per-question-type breakdown:** Factual lookup, numeric extraction, spatial reasoning, multi-hop logic
-- **Error analysis:** Retry statistics, sample failures
-
-### Step 7: Generate Report (Optional)
-
-Use the template to document your findings:
+### 4. Run the held-out evaluation
 
 ```bash
-# Copy template
-cp reports/huy_report_template.md reports/huy_report.md
+ocr-vlm-infer \
+  --questions data/processed/questions/test.jsonl \
+  --output outputs/predictions/test.jsonl \
+  --overwrite
 
-# Edit with your results
-nano reports/huy_report.md
+ocr-vlm-evaluate \
+  --questions data/processed/questions/test.jsonl \
+  --predictions outputs/predictions/test.jsonl \
+  --output results/test_metrics.json
 ```
 
-Fill in the metrics from `results/vlm_gpt5_test_metrics.json`.
+Inference resumes an existing prediction file by default. Use `--overwrite` when
+you intentionally want a fresh run.
 
-## Implementation Details
-
-### Model Configuration
-
-- **Models**: GPT-5 (primary), GPT-4o (fallback)
-- **Temperature**: Default (1.0) for GPT-5, 0.0 (deterministic) for GPT-4o
-- **Max tokens**: 150
-- **Image mode**: High detail
-- **Retry policy**: Single retry with corrective prompt on JSON validation failure
-
-### Prompt Engineering
-
-System message enforces:
-- JSON schema: `{"answer": "text", "confidence": 0.0-1.0}`
-- Strict extraction (no inference beyond visible content)
-- Few-shot examples (2 minimal examples)
-
-User message includes:
-- Question text
-- Explicit guidelines (percentage symbols, date formats)
-- Negative instructions ("Do not infer or calculate")
-
-See `prompts/qa_vlm.txt` for the exact template.
-
-### Evaluation Metrics
-
-The evaluation script computes:
-
-**Accuracy:**
-- **Exact Match (EM)**: Case-insensitive exact string match
-- **Token F1**: Word-level F1 score
-- **Numeric Tolerance**: ±0.5% for percentages/numbers
-
-**Operational:**
-- **Latency**: Median, mean, p95 (ms)
-- **Cost**: Per question and per 100 questions (USD)
-- **Tokens**: Input/output token counts
-- **Retry rate**: Percentage requiring JSON correction
-
-**Question Types:**
-- Factual lookup
-- Numeric extraction
-- Spatial reasoning
-- Multi-hop logic
-
-## Architecture Design
-
-### Single-Step Pipeline
-
-```python
-# Simplified workflow
-image = load_image(image_path)
-response = vlm_client.answer_question(
-    image_path=image_path,
-    question=question_text,
-    system_message=SYSTEM_PROMPT,
-    user_template=USER_TEMPLATE
-)
-answer = parse_and_validate_json(response)
-```
-
-### Error Handling
-
-1. **JSON Validation**: Regex extraction + schema validation
-2. **Retry Logic**: Single retry with corrective prompt (article: 5.2% → 1.3% failure rate)
-3. **Image Handling**: Automatic base64 encoding with high-detail mode
-
-### Cost Optimization
-
-- No image resizing (article: 6% accuracy drop when resized to 768px)
-- Native resolution processing for best accuracy
-- Pricing: $0.0075/1K vision tokens, $0.02/1K output tokens
-
-## Full Workflow Example
-
-Here's the complete end-to-end workflow:
+### 5. Run the offline tests
 
 ```bash
-# 1. Setup (one-time)
-python -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env
-# Edit .env to add OPENAI_API_KEY
-export $(grep -v '^#' .env | xargs)
+python -m unittest discover -s tests -v
+```
 
-# 2. Prepare dataset (one-time)
-python scripts/01_prepare_dataset.py --dev-size 120 --test-size 380
-
-# 3. Run inference
-python scripts/05_answer_questions.py \
-    --mode vlm_image \
-    --model gpt-5 \
-    --questions data/processed/questions/dev.jsonl \
-    --images-root data/raw \
-    --output outputs/answers/vlm_gpt5_dev.jsonl
-
-python scripts/05_answer_questions.py \
-    --mode vlm_image \
-    --model gpt-5 \
-    --questions data/processed/questions/test.jsonl \
-    --images-root data/raw \
-    --output outputs/answers/vlm_gpt5_test.jsonl
-
-# 4. Evaluate
-python scripts/06_evaluate_qa.py \
-    --pred vlm=outputs/answers/vlm_gpt5_dev.jsonl \
-    --questions data/processed/questions/dev.jsonl \
-    --output results/vlm_gpt5_dev_metrics.json
-
-python scripts/06_evaluate_qa.py \
-    --pred vlm=outputs/answers/vlm_gpt5_test.jsonl \
-    --questions data/processed/questions/test.jsonl \
-    --output results/vlm_gpt5_test_metrics.json
-
-# 5. View results
-cat results/vlm_gpt5_test_metrics.json | jq '.vlm'
-
-## License
-
-MIT License - See LICENSE file for details
-
-## Acknowledgments
-
-- OpenAI for GPT-5 and GPT-4o Vision APIs
-- Hugging Face for dataset hosting
-- InfographicVQA dataset creators
+The tests use synthetic records and mocked model responses; they do not download
+the dataset or call the OpenAI API.
